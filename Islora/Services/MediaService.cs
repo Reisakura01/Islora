@@ -14,6 +14,7 @@ internal sealed class MediaService : IDisposable
     private GlobalSystemMediaTransportControlsSession? _session;
     private double _lastRawPos = -1;
     private DateTime _lastRawTime;
+    private bool _wasPlaying;   // 上一次的播放状态（用于在「暂停 → 播放」时重置外推基准）
     private readonly System.Threading.SemaphoreSlim _refreshLock = new(1, 1);
 
     /// <summary>媒体会话变化（null 表示当前无会话）。</summary>
@@ -123,20 +124,33 @@ internal sealed class MediaService : IDisposable
             var playing = session.GetPlaybackInfo()?.PlaybackStatus == GlobalSystemMediaTransportControlsSessionPlaybackStatus.Playing;
 
             var now = DateTime.UtcNow;
-            var pos = rawPos;
-            // 平滑：源位置更新稀疏（如浏览器）时按墙钟外推，让进度条/时间连续走。
+
+            // 重置外推基准的时机：播放状态发生变化（关键在于「暂停 → 播放」），
+            // 或者源上报的位置发生了变化。
             //
-            // ⚠️ 基准 _lastRawTime 必须同时覆盖「暂停中」的情况：
-            // 它原来只在 rawPos 变化时更新，暂停期间既不外推也不刷新基准，
-            // 于是恢复播放的第一帧会把**整个暂停时长**加进位置（暂停 10 分钟 → +600 秒），
-            // 位置被截断到总时长，进度条瞬间显示「已播完」。
-            if (dur > 0 && playing && _lastRawPos >= 0 && rawPos == _lastRawPos)
+            // 这里踩过两次坑，记录清楚：
+            // 1) 基准原来只在 rawPos 变化时刷新 —— 暂停期间不刷新，恢复播放时就把**整个暂停时长**
+            //    加进了位置（暂停 10 分钟 → +600 秒），进度条瞬间跳到曲末。
+            // 2) 于是给外推量加了个「最多 2 秒」的上限 —— 结果误伤了另一类源：
+            //    只上报总时长、位置长期不变的音乐客户端（rawPos 恒为 0），
+            //    基准永不刷新 → 外推量 2 秒后超过上限 → 位置永远停住，
+            //    表现为「进度条填充卡死不动」。
+            // 正确解法是上面第 1 条的真正病根（状态切换时重置基准），而不是限制外推量。
+            if (playing != _wasPlaying || rawPos != _lastRawPos)
             {
-                var extrapolated = (now - _lastRawTime).TotalSeconds;
-                // 再加一道保险：外推最多 2 秒，避免任何异常基准导致跳变
-                if (extrapolated > 0 && extrapolated <= 2.0) pos = rawPos + extrapolated;
+                _wasPlaying = playing;
+                _lastRawPos = rawPos;
+                _lastRawTime = now;
             }
-            if (rawPos != _lastRawPos || !playing) { _lastRawPos = rawPos; _lastRawTime = now; }
+
+            var pos = rawPos;
+            if (dur > 0 && playing)
+            {
+                // 不设人为上限：基准已在状态/位置变化时刷新，外推量自然很小；
+                // 对恒定不更新的源，这里正好提供连续前进。最终由下方的 dur 截断兜底。
+                var extra = (now - _lastRawTime).TotalSeconds;
+                if (extra > 0) pos = rawPos + extra;
+            }
 
             if (pos < 0) pos = 0;
             if (dur > 0 && pos > dur) pos = dur;
